@@ -1,10 +1,8 @@
 #include "imx296.h"
 
-
 /* constants */
 #define MAX_20_BITS                 0xFFFFFU
 #define EXPOSURE_DEF_VALUE          1104U
-
 
 
 /* inline function returns the address of imx296 struct given v4l2_subdev sd member address 
@@ -164,7 +162,82 @@ static int imx296_ctrl_init(struct imx296* sensor);
 
 }   
 
+static int imx296_stream_on(struct imx296* sensor)
+{
+    int ret = 0;
+    
+    /* to start streaming - 1. set standby reg 2. set master mode reg */
+    cci_write(sensor->regmap, IMX296_CTRL00, 0, &ret);
+    usleep_range(2000, 5000);
+    cci_write(sensor->regmap, IMX296_CTRL0A, 0, &ret);
 
+    return ret;
+}
+
+static int imx296_stream_off(struct imx296* sensor)
+{
+    int ret = 0;
+    
+    /* to start streaming - 1. set standby reg 2. set master mode reg */
+    cci_write(sensor->regmap, IMX296_CTRL00, IMX296_CTRL00_STANDBY, &ret);
+    usleep_range(2000, 5000);
+    cci_write(sensor->regmap, IMX296_CTRL0A, IMX296_CTRL0A_XMSTA, &ret);
+
+    return ret;
+}
+
+static int imx296_setup(struct imx296* sensor, v4l2_subdev_state* state)
+{
+    const struct v4l2_mbus_framefmt *fmt;
+    const struct v4l2_rect* crop;
+
+    /* get crop and format settings from state */
+    fmt = v4l2_subdev_state_get_format(state, 0);
+    crop = v4l2_subdev_state_get_crop(state, 0);
+
+    cci_multi_reg_write(sensor->regmap, &imx296_init_table, ARRAY_SIZE(imx296_init_table), &ret);
+
+    /* set roi registers based on crop */
+    if (crop->height != IMX296_MAX_HEIGHT || crop->width != IMX296_MAX_WIDTH)
+    {
+        /* enable vertical and horizontal roi area */
+        cci_reg_write(sensor->regmap, IMX296_FID0_ROI, IMX296_FID0_ROIH1ON | IMX296_FID0_ROIV1ON, &ret);
+        cci_reg_write(sensor->regmap, IMX296_FID0_ROIPH1, crop->top, &ret);
+        cci_reg_write(sensor->regmap, IMX296_FID0_ROIPV1, crop->left, &ret);
+        cci_reg_write(sensor->regmap, IMX296_FID0_ROIWH1, crop->width, &ret);
+        cci_reg_write(sensor->regmap, IMX296_FID0_ROIWV1, crop->height, &ret);
+
+    }
+    else 
+    {
+        /* disable ROI */
+        cci_reg_write(sensor->regmap, IMX296_FID0_ROI, 0, &ret);
+    }
+
+    /* perform horizontal and vertical binning if crop and format dimensions are not equal */
+    cci_reg_write(sensor->regmap, IMX296_CTRL0D, (crop->width != fmt->width ? IMX296_CTRL0D_HADD_ON_BINNING : 0) | 
+                                                    (crop->height != fmt->height ? IMX296_CTRL0D_WINMODE_FD_BINNING : 0) , &ret);
+
+    /* set HMAX and VMAX */
+    cci_reg_write(sensor->regmap, IMX296_HMAX, 1088U, &ret);
+    cci_reg_write(sensor>regmap, IMX296_VMAX, fmt->height + sensor->vblank->cur.val, &ret);
+
+    /* set INCK registers */
+    for (unsigned int i = 0; i < ARRAY_SIZE(clk_params->inksel); i++)
+    {
+        cci_reg_write(sensor->regmap, IMX296_INCKSEL(i), clk_params->inksel[i], &ret);
+    }
+
+	imx296_write(sensor, IMX296_GTTABLENUM, 0xc5, &ret);
+	imx296_write(sensor, IMX296_CTRL418C, sensor->clk_params->ctrl418c,
+		     &ret);
+
+    /* set gaindly and blacklevel */
+    cci_reg_write(sensor->regmap, IMX296_BLKLEVEL, 0x3c, &ret);
+    cci_reg_write(sensor->regmap, IMX296_GAINDLY, IMX296_GAINDLY_NONE, &ret);
+
+    return ret;
+}
 
 /* V4L2 Subdev Operations */
 static int imx296_set_stream()
@@ -353,13 +426,28 @@ static int imx296_set_selection(struct v4l2_subdev *sd, struct v4l2_subdev_state
 
 }
 
-
-
-static int imx296_subdev_init(struct imx296* sensor)
+static int imx296_init_state(struct v4l2_subdev* sd, struct v4l2_subdev_state state)
 {
-    /* need to call v4l2_subdev_init_finalize */
-}
+    /* set format and selection */
+    struct v4l2_subdev_selection sel = {
+        .target = V4L2_SEL_TGT_CROP,
+        .r.width = IMX296_MAX_WIDTH,
+        .r.height = IMX296_MAX_HEIGHT,
+    };
 
+    struct v4l2_subdev_format fmt = {
+        .format = 
+        {
+            .width = IMX296_MAX_WIDTH,
+            .height = IMX296_MAX_HEIGHT,
+        },
+    };
+
+    imx296_set_selection(sd, state, &sel);
+    imx296_set_format(sd, state, &fmt);
+
+    return 0;
+}
 
 
 /* Power Management */
@@ -413,6 +501,33 @@ static void imx296_power_off(struct imx296* sensor)
     gpiod_direction_output(sensor->reset, 1);
     regulator_bulk_disable(ARRAY_SIZE(sensor->supplies), sensor->supplies);
 
+}
+
+
+/******** init's **********/
+
+/* all v4l2 subdev related init's belong in this function */
+static int imx296_subdev_init(struct imx296* sensor)
+{
+
+    struct i2c_client* client = to_i2c_client(sensor->dev);
+    v4l2_i2c_subdev_init(&sensor->sd, client, &imx296_subdev_ops);
+    sensor->sd.internal_ops = &imx296_internal_ops;
+
+    /* v4l2 ctrls init */
+    ret = imx296_ctrls_init(sensor);
+    if (ret < 0)
+        return ret;
+
+    /* create /dev/ node and enable v4l2 events */
+    sensor->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE | V4L2_SUBDEV_FL_HAS_EVENTS;
+
+    /* media pad init */
+    sensor->pad.flags = MEDIA_PAD_FL_SOURCE;
+    sensor->sd.entity.function = MEDIA_ENT_FT_CAM_SENSOR;
+    ret = media_entity_pads_init(&sensor->sd.entity, 1, &sensor->pad);
+
+    /* need to call v4l2_subdev_init_finalize */
 }
 
 

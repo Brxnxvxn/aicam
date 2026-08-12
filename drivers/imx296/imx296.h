@@ -201,7 +201,6 @@ static const struct imx296_clk_params clk_params[] = {
 };
 
 
-
 /* V4L2 subdev Function Prototypes for IMX296 
     - probe() and remove()
     - s_stream()
@@ -215,13 +214,9 @@ static const struct imx296_clk_params clk_params[] = {
 static int imx296_set_stream();           //v4l2_subdev_video_ops
 static int imx296_log_status();         //v4l2_subdev_core_ops
 
-
 /* V4L2 Controls */
 static int imx296_ctrl_init(struct imx296* sensor);
 static int imx296_set_ctrl(struct v4l2_ctrl *ctrl);             //v4l2_subdev_ctrl_ops
-
-
-
 
 /* v4l2 subdev pad ops */
 static int imx296_enum_mbus_code(struct v4l2_subdev *sd, struct v4l2_subdev_state* state, struct v4l2_subdev_mbus_code_enum *code);     //v4l2_subdev_pad_ops
@@ -230,9 +225,6 @@ static int imx296_get_fmt(struct v4l2_subdev *sd, struct v4l2_subdev_state* stat
 static int imx296_enum_frame_size(struct v4l2_subdev *sd, struct v4l2_subdev_state* state, struct v4l2_subdev_frame_size_enum *fse);
 static int imx296_get_selection(struct v4l2_subdev *sd, struct v4l2_subdev_state *state, struct v4l2_subdev_selection *sel);
 static int imx296_set_selection(struct v4l2_subdev *sd, struct v4l2_subdev_state *state, struct v4l2_subdev_selection *sel);
-
-
-
 
 /* Power related functions */
 static int imx296_power_on(struct imx296* sensor);
@@ -245,6 +237,15 @@ static int imx296_probe(struct i2c_client *client);
 static void imx296_remove(struct i2c_client *client);
 static int imx296_subdev_init(struct imx296* sensor);
 
+
+/* v4l2 subdev internal ops */
+static int imx296_init_state(struct v4l2_subdev* sd, struct v4l2_subdev_state state);
+
+
+/* helper functions */
+static int imx296_stream_on(struct imx296* sensor);
+static int imx296_stream_off(struct imx296* sensor);
+static int imx296_setup(struct imx296* sensor, v4l2_subdev_state* state);
 
 /* struct definitions 
     - need a main imx296 struct which should contain the following
@@ -288,6 +289,10 @@ struct dev_pm_ops imx296_pm_ops = {
     //RUNTIME_PM_OPS(imx296_runtime_suspend, imx296_runtime_resume, NULL);
 };
 
+struct v4l2_subdev_internal_ops imx296_internal_ops = {
+    .init_state = imx296_init_state,
+};
+
 struct imx296 {
 
     struct v4l2_subdev sd;
@@ -315,3 +320,52 @@ struct imx296 {
 
 };
 
+/* init table for imx296_setup */
+/*
+ * This table is extracted from vendor data that is entirely undocumented. The
+ * first register write is required to activate the CSI-2 output. The other
+ * entries may or may not be optional?
+ */
+struct cci_reg_sequence imx296_init_table[] = {
+	{ IMX296_REG_8BIT(0x3005), 0xf0 },
+	{ IMX296_REG_8BIT(0x309e), 0x04 },
+	{ IMX296_REG_8BIT(0x30a0), 0x04 },
+	{ IMX296_REG_8BIT(0x30a1), 0x3c },
+	{ IMX296_REG_8BIT(0x30a4), 0x5f },
+	{ IMX296_REG_8BIT(0x30a8), 0x91 },
+	{ IMX296_REG_8BIT(0x30ac), 0x28 },
+	{ IMX296_REG_8BIT(0x30af), 0x09 },
+	{ IMX296_REG_8BIT(0x30df), 0x00 },
+	{ IMX296_REG_8BIT(0x3165), 0x00 },
+	{ IMX296_REG_8BIT(0x3169), 0x10 },
+	{ IMX296_REG_8BIT(0x316a), 0x02 },
+	{ IMX296_REG_8BIT(0x31c8), 0xf3 },	/* Exposure-related */
+	{ IMX296_REG_8BIT(0x31d0), 0xf4 },	/* Exposure-related */
+	{ IMX296_REG_8BIT(0x321a), 0x00 },
+	{ IMX296_REG_8BIT(0x3226), 0x02 },
+	{ IMX296_REG_8BIT(0x3256), 0x01 },
+	{ IMX296_REG_8BIT(0x3541), 0x72 },
+	{ IMX296_REG_8BIT(0x3516), 0x77 },
+	{ IMX296_REG_8BIT(0x350b), 0x7f },
+	{ IMX296_REG_8BIT(0x3758), 0xa3 },
+	{ IMX296_REG_8BIT(0x3759), 0x00 },
+	{ IMX296_REG_8BIT(0x375a), 0x85 },
+	{ IMX296_REG_8BIT(0x375b), 0x00 },
+	{ IMX296_REG_8BIT(0x3832), 0xf5 },
+	{ IMX296_REG_8BIT(0x3833), 0x00 },
+	{ IMX296_REG_8BIT(0x38a2), 0xf6 },
+	{ IMX296_REG_8BIT(0x38a3), 0x00 },
+	{ IMX296_REG_8BIT(0x3a00), 0x80 },
+	{ IMX296_REG_8BIT(0x3d48), 0xa3 },
+	{ IMX296_REG_8BIT(0x3d49), 0x00 },
+	{ IMX296_REG_8BIT(0x3d4a), 0x85 },
+	{ IMX296_REG_8BIT(0x3d4b), 0x00 },
+	{ IMX296_REG_8BIT(0x400e), 0x58 },
+	{ IMX296_REG_8BIT(0x4014), 0x1c },
+	{ IMX296_REG_8BIT(0x4041), 0x2a },
+	{ IMX296_REG_8BIT(0x40a2), 0x06 },
+	{ IMX296_REG_8BIT(0x40c1), 0xf6 },
+	{ IMX296_REG_8BIT(0x40c7), 0x0f },
+	{ IMX296_REG_8BIT(0x40c8), 0x00 },
+	{ IMX296_REG_8BIT(0x4174), 0x00 },
+};
