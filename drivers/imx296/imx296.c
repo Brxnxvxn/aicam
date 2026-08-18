@@ -240,8 +240,52 @@ static int imx296_setup(struct imx296* sensor, v4l2_subdev_state* state)
 }
 
 /* V4L2 Subdev Operations */
-static int imx296_set_stream()
+static int imx296_set_stream(struct v4l2_subdev* sd, int enable)
 {
+    struct imx296* sensor =  to_imx296(sd);
+    v4l2_subdev_state* state;
+    int ret;
+
+    /* get active state */
+    state = v4l2_subdev_get_locked_active_state(sd);
+
+    if (!enable)
+    {
+        /* call stream off if enabled is turned off */
+        ret = imx296_stream_off(sensor);
+        goto unlock;
+    }
+
+    /* power on dev - return if fail */
+    ret = pm_runtime_resume_and_get(sensor->sd.dev);
+    if (ret < 0)
+        goto unlock;
+
+    /* run setup */
+    ret = imx296_setup(sensor);
+    if (ret < 0)
+        goto err_pm;
+
+    /* perform v4l2 ctrl reg writes */
+    ret = __v4l2_ctrl_handler_setup(sensor->ctrl_handler);
+    if (ret < 0)
+        goto err_pm;
+
+    /* turn on streaming */
+    ret = imx296_stream_on(sensor);
+    if (ret < 0)
+        goto err_pm;
+
+    return ret;
+
+/* turn off power */
+err_pm:
+    pm_runtime_put(sensor->sd.dev);
+    goto unlock;
+
+unlock:
+    v4l2_subdev_unlock_state(state);
+    return ret;
 
 } 
 
@@ -510,12 +554,14 @@ static void imx296_power_off(struct imx296* sensor)
 static int imx296_subdev_init(struct imx296* sensor)
 {
 
+    int ret;
+
     struct i2c_client* client = to_i2c_client(sensor->dev);
     v4l2_i2c_subdev_init(&sensor->sd, client, &imx296_subdev_ops);
     sensor->sd.internal_ops = &imx296_internal_ops;
 
     /* v4l2 ctrls init */
-    ret = imx296_ctrls_init(sensor);
+    ret = imx296_ctrl_init(sensor);
     if (ret < 0)
         return ret;
 
@@ -527,13 +573,127 @@ static int imx296_subdev_init(struct imx296* sensor)
     sensor->sd.entity.function = MEDIA_ENT_FT_CAM_SENSOR;
     ret = media_entity_pads_init(&sensor->sd.entity, 1, &sensor->pad);
 
+    /* free ctrl handler if media pad init fails */
+    if (ret < 0)
+    {
+        v4l2_ctrl_handler_free(&sensor->ctrl_handler);
+        return ret;
+    }
+
+    /* set subdev state lock to ctrl lock */
+    sensor->sd.state_lock = sensor->subdev.ctrl_handler->lock;
+
     /* need to call v4l2_subdev_init_finalize */
+    v4l2_subdev_init_finalize(sensor->sd);
+
+    return ret;
+
 }
 
+static void imx296_subdev_cleanup(struct imx296* sensor)
+{
+    media_entity_cleanup(&sensor->sd.entity);
+    v4l2_ctrl_handler_free(&sensor->ctrl_handler);
+
+}
 
 static int imx296_probe(struct i2c_client *client)
 {
 
+    struct im296* sensor;
+
+    /* alloc driver data */
+    sensor = devm_kzalloc(&client->dev, sizeof(*sensor), GFP_KERNEL);
+
+    /* failed to allocate sensor data */
+    if (!sensor)
+        return -ENOMEM;
+    
+    /* assign device struct to sensor */
+    sensor->dev = i2c_client->dev;
+
+    /* get resources - power supplies, clocks, GPIO */
+    for (int i = 0; i < IMX296_NUM_SUPPLIES; i++)
+        sensor->supplies[i].supply = imx296_supply_names[i];
+
+    ret = devm_regulator_bulk_get(sensor->dev, ARRAY_SIZE(sensor->supplies), sensor->supplies);
+
+    if (ret)
+    {
+        return dev_err_probe(sensor->dev, ret, "Failed to get supplies\n")
+    }
+
+    /* get reset GPIO pin */
+    sensor->reset = devm_gpiod_get(sensor->dev, "reset", GPIOD_OUT_HIGH);
+
+    if (IS_ERR(sensor->reset))
+        return dev_err_probe(sensor->dev, PTR_ERR(sensor->reset), "failed to get reset gpio\n");
+
+    /* get clk */
+    sensor->xclk = devm_v4l2_sensor_get_clk(sensor->dev, "inck");
+
+    if(IS_ERR(sensor->clk))
+        return dev_err_probe(sensor->dev, PTR_ERR(sensor->clk), "failed to get clk\n");
+
+    clk_rate = clk_get_rate(sensor->clk);
+    for (int i = 0; i < ARRAY_SIZE(imx296_clk_params); i++)
+    {
+        if (clk_rate == imx296_clk_params[i].freq)
+        {
+            sensor->clk_params = &imx296_clk_params[i];
+            break;
+        }
+
+    }
+
+    /* if clk_params is still null, the clk rate is no supported - fail */
+    if  (!sensor->clk_params)
+    {
+        dev_err(sensor->dev, "unsupported clk rate %lu\n", clk_rate);
+        return -EINVAL;
+    }
+
+    /* init regmap */
+    sensor->regmap = devm_regmap_init_i2c(client, &imx296_regmap_config);
+    if (IS_ERR(sensor->regmap))
+        return dev_err_probe(sensor->dev, PTR_ERR(sensor->regmap), "failed to get regmap\n");
+
+    /* power on dev */
+    ret = imx296_power_on(sensor);
+    if (ret < 0)
+        return ret;
+
+    /* subdev init - media pad, v4l2 ctrl init*/
+    ret = imx296_subdev_init(sensor);
+    if (ret < 0)
+        goto err_power;
+
+
+    /* need to enable pm runtime */
+    pm_runtime_set_active(sensor->dev);
+    pm_runtime_get_noresume(sensor->dev);
+    pm_runtime_enable(sensor->dev);
+
+    /* register the v4l2 subdev */
+    ret = v4l2_async_register_subdev(&sensor->sd);
+    if (ret < 0)
+        goto err_pm;
+
+    /* turn off device after setup */
+    pm_runtime_set_autosuspend_delay(sensor->dev, 1000);
+    pm_runtime_set_autosuspend(sensor->dev);
+    pm_runtime_put_autosuspend(sensor->dev);
+
+    return 0;
+
+err_pm:
+    pm_runtime_disable(sensor->dev);
+    pm_runtime_put_noidle(sensor->dev);
+    imx296_subdev_cleanup(sensor);
+    goto err_power;
+err_power:
+    imx296_power_off(sensor);
+    return ret;
 
 }
 
@@ -541,7 +701,19 @@ static int imx296_probe(struct i2c_client *client)
 static void imx296_remove(struct i2c_client *client)
 {
 
+    struct v4l2_subdev* sd = i2c_get_clientdata(client);
+    struct imx296* sensor = to_imx296(sd);
+
     /* need to call v4l2_device_unregister_subdev() */
+    v4l2_async_unregister_subdev(sd);
+
+    imx296_subdev_cleanup(sensor);
+
+    /* disable runtime PM */
+    pm_runtime_disable(sensor->dev);
+    if(!pm_runtime_status_suspended(sensor->dev))
+        imx296_power_off(sensor);
+    pm_runtime_set_suspended(sensor->dev);
 
 }
 

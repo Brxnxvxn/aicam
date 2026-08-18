@@ -211,7 +211,7 @@ static const struct imx296_clk_params clk_params[] = {
     - get_fmt()
     - 
 */
-static int imx296_set_stream();           //v4l2_subdev_video_ops
+static int imx296_set_stream(struct v4l2_subdev* sd, int enable);           //v4l2_subdev_video_ops
 static int imx296_log_status();         //v4l2_subdev_core_ops
 
 /* V4L2 Controls */
@@ -296,6 +296,7 @@ struct v4l2_subdev_internal_ops imx296_internal_ops = {
 struct imx296 {
 
     struct v4l2_subdev sd;
+    struct device* dev;
     struct media_pad pad;
     struct i2c_client *client;
     bool mono;
@@ -315,6 +316,7 @@ struct imx296 {
 
     /* Power / Clocks / Regulators */
     struct clk      *xclk;
+    const struct imx296_clk_params* clk_params;
     struct gpio_desc *rst_gpio;
     struct regulator_bulk_data supplies[IMX296_NUM_SUPPLIES];
 
