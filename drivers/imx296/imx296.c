@@ -547,6 +547,30 @@ static void imx296_power_off(struct imx296* sensor)
 
 }
 
+static int imx296_runtime_suspend(struct device* dev)
+{
+    /* pointer manipulation to get to sensor struct */
+    struct i2c_client* client = to_i2c_adapter(dev);
+    struct v4l2_subdev* sd = i2c_get_clientdata(client);
+    struct imx296* sensor = to_imx296(sd);
+
+    /* call driver power off function */
+    imx296_power_off(sensor);
+
+    return 0;
+    
+}
+
+static int imx296_runtime_resume(struct device* dev)
+{
+    /* pointer manipulation to get to sensor struct */
+    struct i2c_client* client = to_i2c_adapter(dev);
+    struct v4l2_subdev* sd = i2c_get_clientdata(client);
+    struct imx296* sensor = to_imx296(sd);
+
+    return imx296_power_off(sensor);
+
+}
 
 /******** init's **********/
 
